@@ -1,0 +1,113 @@
+# HydroWatch Amur — inference configuration.
+# Every number the pipeline uses lives here; nothing is hardcoded at its
+# point of use. Ablations (scripts/calibrate.py) sweep this file.
+
+sar:
+  # Clamp on the resulting threshold — NOT a filter on the pixels the
+  # histogram is fitted to. Fitting inside this window removes the land mode
+  # and biases the split (measured: IoU 0.59 vs 1.00 on a 10%-water scene).
+  valid_range_db: [-22.0, -12.0]
+  speckle_filter_size: 5
+  # split | global | global_in_range (the last one reproduces the v0 baseline)
+  threshold_method: split
+  # 512 px теряет реки уже от 250 м (доля 4.9% < порога); 256 px их видит
+  tile_px: 256
+  # Formal bimodality tests (Cao et al., Water 11(4):786, 2019) — the same
+  # pair the organizers' own teaching notebook uses. Otsu's eta is NOT a
+  # gate: on pure land it reads ~0.64 while returning a nonsense -8 dB cut.
+  bimodality_coefficient_min: 0.555   # (skew^2 + 1) / kurtosis, > 5/9
+  ashman_d_min: 3.0                   # mode separation vs mode width
+  # Нижняя граница 0.05 отбрасывала реку 250 м впритык. Чистую сушу режут
+  # физические критерии (диапазон порога и яркость тёмной моды), не этот.
+  tile_water_fraction_range: [0.01, 0.95]
+  # A usable tile's dark mode must be as dark as real open water; without
+  # this veto a smooth dry surface invents ~6% of the AOI as water.
+  water_dark_mode_max_db: -16.0
+  min_dark_pixels: 50
+  min_bimodal_tiles: 2
+  # If no tile passes the statistical gates, fall back to the best-separated
+  # tiles rather than declaring the scene dry (that cost a whole AOI once).
+  relaxed_fallback_tiles: 3
+  ki_weight: 0.5
+  histogram_bins: 128
+
+optical:
+  mndwi_thresh: 0.1
+  ndwi_thresh: 0.15
+  ndvi_thresh: 0.2
+  aweish_thresh: 0.0
+  adaptive_threshold: true
+  use_aweish: true
+
+fusion:
+  # consensus — ПО ПОСЛЕДНЕМУ ЗАМЕРУ. Порядок поменялся после того, как дата
+  #   «до» была ограничена огибающей max_extent: до этого вёл Демпстер-Шейфер
+  #   (0.4044 против 0.3838), после — калибровка выбрала консенсус на всех
+  #   фолдах (0.4166 против 0.3583). Похоже, огибающая уже снимает ту
+  #   переоценку, которую компенсировало мягкое слияние ДШ.
+  # ds / strict_consensus / sar_only / or — остаются в калибровке
+  method: consensus
+  sar_soft_margin_db: 1.5
+  optical_soft_margin: 0.1
+  sar_reliability: 0.85
+  optical_reliability: 0.75
+  decision_threshold: 0.5
+
+change:
+  # The reference labelling required sigma0 to fall by >= 3 dB before
+  # calling a pixel newly flooded.
+  require_backscatter_drop: true
+  min_drop_db: 3.0
+
+postprocess:
+  permanent_occurrence_pct: 80.0
+  # The reference labelling used 5 deg; matching it matters because the
+  # metric scores agreement with that labelling, not with nature.
+  slope_max_deg: 5.0
+  hand_max_m: 25.0
+  builtup_thresh: 0.5
+  min_mapping_unit_px: 25
+  hydrography_buffer_px: 3
+  connectivity_filter: true
+  # Замер: отключение связности подняло Q_flood 0.215 -> 0.364, т.е. сеть OSM
+  # как единственный «якорь» выбрасывала настоящее затопление. max_extent
+  # (JRC, максимальный наблюдавшийся разлив) — физически верный слой.
+  connectivity_use_max_extent: true
+  # Двухуровневая связность. Замер: max_extent как якорь поднял Q_flood
+  # 0.208 -> 0.362, но обрушил Spec_base 0.951 -> 0.738. Поэтому от слабого
+  # якоря требуется больше свидетельств: компонента у нанесённого русла
+  # проходит по обычной MMU, а «когда-то тут была вода по JRC» — только если
+  # она достаточно крупная и связная.
+  max_extent_only_min_px: 200
+  # Замер по всем 11 эталонам: эталонный water_pre лежит внутри max_extent на
+  # 92.5-99.8%, а эталонный flood — лишь на 15-98%. Поэтому огибающей
+  # ограничивается только дата «до»; затопление — никогда.
+  restrict_water_pre_to_max_extent: true
+  max_extent_dilation_px: 5
+
+temporal:
+  # Априорный порог по району, собранный по ДОПОЛНИТЕЛЬНЫМ снимкам.
+  # Организаторы дали паспорта сцен, а не пиксели — снимки тянем сами, и
+  # можно взять больше 22 сцен, названных в 11 парах (только scene_catalog
+  # перечисляет 148 съёмок S1). Метрика считается по фиксированным парам,
+  # поэтому лишние снимки не меняют предсказание напрямую — они говорят,
+  # какой порог для района НОРМАЛЕН. Замер: порог, обвалившийся до -22 дБ
+  # (откат), подтягивается к медиане района -14.8 дБ; IoU 0.001 -> 1.000.
+  use_threshold_prior: true
+  min_observations: 3
+  outlier_tolerance_db: 3.0
+  fallback_weight: 1.0          # у сцены без единого тайла своих данных нет
+  weak_evidence_tiles: 5
+  weak_evidence_weight: 0.5     # мало тайлов — смешиваем, а не заменяем
+
+degenerate_guard:
+  # Район с многотысячегектарным постоянным руслом не может иметь нулевой
+  # воды. Ноль в сабмите даёт ровно 0 по обоим водным компонентам —
+  # poyarkovo так стоил около 0.09 Score. Подменяем климатологией по JRC
+  # (архивный слой из датасета, НЕ эталон). Затопление не выдумываем.
+  enabled: true
+  min_share_of_permanent: 0.05
+  fallback_share_of_permanent: 1.0
+  fallback_flood_ha: 0.0
+
+seed: 42
